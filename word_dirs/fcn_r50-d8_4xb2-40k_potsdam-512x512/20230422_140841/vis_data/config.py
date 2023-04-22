@@ -6,7 +6,7 @@ data_preprocessor = dict(
     bgr_to_rgb=True,
     pad_val=0,
     seg_pad_val=255,
-    size=(512, 1024))
+    size=(512, 512))
 model = dict(
     type='EncoderDecoder',
     data_preprocessor=dict(
@@ -16,7 +16,7 @@ model = dict(
         bgr_to_rgb=True,
         pad_val=0,
         seg_pad_val=255,
-        size=(512, 1024)),
+        size=(512, 512)),
     pretrained='open-mmlab://resnet50_v1c',
     backbone=dict(
         type='ResNetV1c',
@@ -30,15 +30,16 @@ model = dict(
         style='pytorch',
         contract_dilation=True),
     decode_head=dict(
-        type='PSPHead',
+        type='FCNHead',
         in_channels=2048,
         in_index=3,
         channels=512,
-        pool_scales=(1, 2, 3, 6),
+        num_convs=2,
+        concat_input=True,
         dropout_ratio=0.1,
         num_classes=19,
         norm_cfg=dict(type='SyncBN', requires_grad=True),
-        align_corners=False,
+        align_corners=True,
         loss_decode=dict(
             type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0)),
     auxiliary_head=dict(
@@ -51,31 +52,31 @@ model = dict(
         dropout_ratio=0.1,
         num_classes=19,
         norm_cfg=dict(type='SyncBN', requires_grad=True),
-        align_corners=False,
+        align_corners=True,
         loss_decode=dict(
             type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.4)),
     train_cfg=dict(),
     test_cfg=dict(mode='whole'))
-dataset_type = 'CityscapesDataset'
-data_root = 'data/cityscapes/'
-crop_size = (512, 1024)
+dataset_type = 'PotsdamDataset'
+data_root = 'data/potsdam'
+crop_size = (512, 512)
 train_pipeline = [
     dict(type='LoadImageFromFile'),
-    dict(type='LoadAnnotations'),
+    dict(type='LoadAnnotations', reduce_zero_label=True),
     dict(
         type='RandomResize',
-        scale=(2048, 1024),
+        scale=(512, 512),
         ratio_range=(0.5, 2.0),
         keep_ratio=True),
-    dict(type='RandomCrop', crop_size=(512, 1024), cat_max_ratio=0.75),
+    dict(type='RandomCrop', crop_size=(512, 512), cat_max_ratio=0.75),
     dict(type='RandomFlip', prob=0.5),
     dict(type='PhotoMetricDistortion'),
     dict(type='PackSegInputs')
 ]
 test_pipeline = [
     dict(type='LoadImageFromFile'),
-    dict(type='Resize', scale=(2048, 1024), keep_ratio=True),
-    dict(type='LoadAnnotations'),
+    dict(type='Resize', scale=(512, 512), keep_ratio=True),
+    dict(type='LoadAnnotations', reduce_zero_label=True),
     dict(type='PackSegInputs')
 ]
 img_ratios = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75]
@@ -123,24 +124,24 @@ tta_pipeline = [
                     }]])
 ]
 train_dataloader = dict(
-    batch_size=2,
-    num_workers=2,
+    batch_size=4,
+    num_workers=4,
     persistent_workers=True,
     sampler=dict(type='InfiniteSampler', shuffle=True),
     dataset=dict(
-        type='CityscapesDataset',
-        data_root='data/cityscapes/',
+        type='PotsdamDataset',
+        data_root='data/potsdam',
         data_prefix=dict(
-            img_path='leftImg8bit/train', seg_map_path='gtFine/train'),
+            img_path='img_dir/train', seg_map_path='ann_dir/train'),
         pipeline=[
             dict(type='LoadImageFromFile'),
-            dict(type='LoadAnnotations'),
+            dict(type='LoadAnnotations', reduce_zero_label=True),
             dict(
                 type='RandomResize',
-                scale=(2048, 1024),
+                scale=(512, 512),
                 ratio_range=(0.5, 2.0),
                 keep_ratio=True),
-            dict(type='RandomCrop', crop_size=(512, 1024), cat_max_ratio=0.75),
+            dict(type='RandomCrop', crop_size=(512, 512), cat_max_ratio=0.75),
             dict(type='RandomFlip', prob=0.5),
             dict(type='PhotoMetricDistortion'),
             dict(type='PackSegInputs')
@@ -151,14 +152,13 @@ val_dataloader = dict(
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
-        type='CityscapesDataset',
-        data_root='data/cityscapes/',
-        data_prefix=dict(
-            img_path='leftImg8bit/val', seg_map_path='gtFine/val'),
+        type='PotsdamDataset',
+        data_root='data/potsdam',
+        data_prefix=dict(img_path='img_dir/val', seg_map_path='ann_dir/val'),
         pipeline=[
             dict(type='LoadImageFromFile'),
-            dict(type='Resize', scale=(2048, 1024), keep_ratio=True),
-            dict(type='LoadAnnotations'),
+            dict(type='Resize', scale=(512, 512), keep_ratio=True),
+            dict(type='LoadAnnotations', reduce_zero_label=True),
             dict(type='PackSegInputs')
         ]))
 test_dataloader = dict(
@@ -167,14 +167,13 @@ test_dataloader = dict(
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
-        type='CityscapesDataset',
-        data_root='data/cityscapes/',
-        data_prefix=dict(
-            img_path='leftImg8bit/val', seg_map_path='gtFine/val'),
+        type='PotsdamDataset',
+        data_root='data/potsdam',
+        data_prefix=dict(img_path='img_dir/val', seg_map_path='ann_dir/val'),
         pipeline=[
             dict(type='LoadImageFromFile'),
-            dict(type='Resize', scale=(2048, 1024), keep_ratio=True),
-            dict(type='LoadAnnotations'),
+            dict(type='Resize', scale=(512, 512), keep_ratio=True),
+            dict(type='LoadAnnotations', reduce_zero_label=True),
             dict(type='PackSegInputs')
         ]))
 val_evaluator = dict(type='IoUMetric', iou_metrics=['mIoU'])
@@ -186,13 +185,13 @@ env_cfg = dict(
     dist_cfg=dict(backend='nccl'))
 vis_backends = [
     dict(type='LocalVisBackend'),
-    dict(type='TensorBoardVisBackend')
+    dict(type='TensorboardVisBackend')
 ]
 visualizer = dict(
     type='SegLocalVisualizer',
     vis_backends=[
         dict(type='LocalVisBackend'),
-        dict(type='TensorBoardVisBackend')
+        dict(type='TensorboardVisBackend')
     ],
     name='visualizer')
 log_processor = dict(by_epoch=False)
@@ -224,3 +223,5 @@ default_hooks = dict(
     checkpoint=dict(type='CheckpointHook', by_epoch=False, interval=4000),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='SegVisualizationHook'))
+launcher = 'none'
+work_dir = 'work_dirs/fcn_r50-d8_4xb2-40k_potsdam-512x512'
