@@ -6,7 +6,7 @@ env_cfg = dict(
 )
 # 增加 TensorBoard可视化
 vis_backends = [dict(type='LocalVisBackend'),
-                dict(type='TensorBoardVisBackend')]
+                dict(type='TensorboardVisBackend')]
 visualizer = dict(
     type='SegLocalVisualizer', vis_backends=vis_backends, name='visualizer')
 log_processor = dict(by_epoch=False)
