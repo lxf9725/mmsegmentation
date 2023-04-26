@@ -63,7 +63,7 @@ def clip_big_image(image_path, clip_save_dir, to_label=False):
         np.minimum(xmin + cs, w),
         np.minimum(ymin + cs, h)
     ],
-                     axis=1)
+        axis=1)
 
     if to_label:
         color_map = np.array([[0, 0, 0], [255, 255, 255], [255, 0, 0],
@@ -82,8 +82,8 @@ def clip_big_image(image_path, clip_save_dir, to_label=False):
     for box in boxes:
         start_x, start_y, end_x, end_y = box
         clipped_image = image[start_y:end_y,
-                              start_x:end_x] if to_label else image[
-                                  start_y:end_y, start_x:end_x, :]
+                        start_x:end_x] if to_label else image[
+                                                        start_y:end_y, start_x:end_x, :]
         area_idx = osp.basename(image_path).split('_')[3].strip('.tif')
         mmcv.imwrite(
             clipped_image.astype(np.uint8),
