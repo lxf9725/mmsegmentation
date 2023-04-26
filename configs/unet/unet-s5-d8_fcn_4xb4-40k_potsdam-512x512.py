@@ -1,5 +1,5 @@
 _base_ = [
-    '../_base_/models/fcn_unet_s5-d16.py', '../_base_/datasets/vaihingen.py',
+    '../_base_/models/fcn_unet_s5-d8.py', '../_base_/datasets/potsdam.py',
     '../_base_/default_runtime.py', '../_base_/schedules/schedule_40k.py'
 ]
 crop_size = (512, 512)

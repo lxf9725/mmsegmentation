@@ -2,18 +2,17 @@ _base_ = [
     '../_base_/models/setr_naive.py', '../_base_/datasets/vaihingen_256.py',
     '../_base_/default_runtime.py', '../_base_/schedules/schedule_160k.py'
 ]
-crop_size = (256,256)
+crop_size = (256, 256)
 data_preprocessor = dict(size=crop_size)
-norm_cfg\
-    = dict(type='BN', requires_grad=True)
+norm_cfg = dict(type='SyncBN', requires_grad=True)
 model = dict(
     data_preprocessor=data_preprocessor,
     pretrained=None,
     backbone=dict(
         img_size=(512, 512),
-        drop_rate=0.,),
-        # init_cfg=dict(
-        #     type='Pretrained', checkpoint='pretrain/vit_large_p16.pth')),
+        drop_rate=0., ),
+    # init_cfg=dict(
+    #     type='Pretrained', checkpoint='pretrain/vit_large_p16.pth')),
     decode_head=dict(num_classes=6),
     auxiliary_head=[
         dict(
