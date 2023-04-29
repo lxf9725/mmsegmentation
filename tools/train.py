@@ -13,8 +13,7 @@ from mmseg.registry import RUNNERS
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a segmentor')
-    parser.add_argument('config', default='configs/fcn/fcn_r50-d8_4xb2-40k_potsdam-512x512_test.py',
-                        help='train config file path')
+    parser.add_argument('config', help='train config file path')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument(
         '--resume',

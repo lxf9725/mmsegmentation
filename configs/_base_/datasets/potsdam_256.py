@@ -1,6 +1,6 @@
 # dataset settings
 dataset_type = 'PotsdamDataset'
-data_root = 'data/potsdam_256'
+data_root = ''data/potsdam_256''
 crop_size = (256, 256)
 train_pipeline = [
     dict(type='LoadImageFromFile'),
