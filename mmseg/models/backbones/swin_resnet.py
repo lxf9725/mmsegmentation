@@ -12,9 +12,16 @@ from mmengine.model import BaseModule, ModuleList
 from mmengine.model.weight_init import (trunc_normal_)
 from mmengine.utils import to_2tuple
 from mmengine.utils.dl_utils.parrots_wrapper import _BatchNorm
-
+from mmengine.logging import print_log
 from mmseg.registry import MODELS
 from ..utils import ResLayer
+from ..utils.embed import PatchEmbed, PatchMerging
+
+from mmengine.model.weight_init import (constant_init, trunc_normal_,
+                                        trunc_normal_init)
+
+from mmengine.runner import CheckpointLoader
+from collections import OrderedDict
 
 
 class BasicBlock(BaseModule):
@@ -759,16 +766,463 @@ class SwinResNet(BaseModule):
     """
 
     """
+    res_arch_settings = {
+        18: (BasicBlock, (2, 2, 2, 2)),
+        34: (BasicBlock, (3, 4, 6, 3)),
+        50: (Bottleneck, (3, 4, 6, 3)),
+        101: (Bottleneck, (3, 4, 23, 3)),
+        152: (Bottleneck, (3, 8, 36, 3))
+    }
+
     def __init__(self,
-                 pretrain_img_size=224,
+                 res_depth,
                  in_channels=3,
-                 embed_dims=96,
-                 patch_size=4,
-                 window_size=7,
-                 mlp_ratio=4,
-                 depths=(2,2,6,4),
-                 num_heads=(3,6,12,24),
-                 swin_strides=(4,2,2,2),
-                 res_strides=(1,2,2,2),
-                 out_indices=(01)
-                 ):
+                 out_indices=(0, 1, 2, 3),
+                 swin_pretrain_img_size=224,
+                 swin_embed_dims=96,
+                 swin_patch_size=4,
+                 swin_window_size=7,
+                 swin_mlp_ratio=4,
+                 swin_depths=(2, 2, 6, 4),
+                 swin_num_heads=(3, 6, 12, 24),
+                 swin_strides=(4, 2, 2, 2),
+                 swin_qkv_bias=True,
+                 swin_qk_scale=None,
+                 swin_patch_norm=None,
+                 swin_drop_rate=0.,
+                 swin_attn_drop_rate=0.,
+                 swin_drop_path_rate=0.1,
+                 swin_use_abs_pas_embed=False,
+                 swin_act_cfg=dict(type='GELU'),
+                 swin_norm_cfg=dict(type='LN'),
+                 res_stem_channels=64,
+                 res_base_channels=64,
+                 res_num_stages=4,
+                 res_strides=(1, 2, 2, 2),
+                 res_dilations=(1, 1, 1, 1),
+                 res_style='pytorch',
+                 res_deep_stem=False,
+                 res_avg_down=False,
+                 res_conv_cfg=None,
+                 res_norm_cfg=dict(type='BN', requires_grad=True),
+                 res_norm_eval=False,
+                 res_dcn=None,
+                 res_stage_with_dcn=(False, False, False, False),
+                 res_plugins=None,
+                 res_multi_grid=None,
+                 res_contract_dilation=False,
+                 res_zero_init_residual=True,
+                 with_cp=False,
+                 swin_pretrained=None,
+                 res_pretrained=None,
+                 frozen_stages=-1,
+                 init_cfg=None):
+        # ResNet
+        self.res_depth = res_depth
+        self.frozen_stages = frozen_stages,
+        self.swin_pretrained = swin_pretrained,
+        self.res_pretrained = res_pretrained,
+        self.res_zero_init_residual = res_zero_init_residual,
+        res_block_init_cfg = None
+        self.res_depth = res_depth,
+        self.res_stem_channels = res_stem_channels
+        self.res_base_channels = res_base_channels
+        self.res_num_stages = res_num_stages
+        assert 1 <= res_num_stages <= 4
+        self.res_strides = res_strides
+        self.res_dilations = res_dilations
+        assert len(res_strides) == len(res_dilations) == res_num_stages
+        self.out_indices = out_indices
+        assert max(out_indices) < res_num_stages
+        self.res_style = res_style
+        self.res_deep_stem = res_deep_stem
+        self.res_avg_down = res_avg_down
+        self.with_cp = with_cp,
+        self.res_conv_cfg = res_conv_cfg
+        self.res_norm_cfg = res_norm_cfg
+        self.res_norm_eval = res_norm_eval
+        self.res_dcn = res_dcn
+        self.res_stage_with_dcn = res_stage_with_dcn
+        if res_dcn is not None:
+            assert len(res_stage_with_dcn) == res_num_stages
+        self.res_plugins = res_plugins
+        self.res_multi_grid = res_multi_grid
+        self.res_contract_dilation = res_contract_dilation
+        self.res_block, res_stage_blocks = self.res_arch_settings[res_depth]
+        self.res_stage_blocks = res_stage_blocks[:res_num_stages]
+        self.res_inplanes = res_stem_channels
+
+        # SwinTransformer
+        swin_num_layers = len(swin_depths)
+        self.swin_use_abs_pos_embed = swin_use_abs_pas_embed
+        assert swin_strides[0] == swin_patch_size, 'Use non-overlapping patch embed.'
+        # 判断输入配置是否正确
+        # 判断resnet块个数设置是否正确
+        if res_depth not in self.res_arch_settings:
+            raise KeyError(f'invalid depth{res_depth} for resnet')
+
+        if isinstance(swin_pretrain_img_size, int):
+            swin_pretrain_img_size = to_2tuple(swin_pretrain_img_size)
+        elif isinstance(swin_pretrain_img_size, tuple):
+            if len(swin_pretrain_img_size) == 1:
+                swin_pretrain_img_size = to_2tuple(swin_pretrain_img_size[0])
+            assert len(swin_pretrain_img_size) == 2, \
+                f'The size of image should have length 1 or 2, ' \
+                f'but got {len(swin_pretrain_img_size)}'
+        # 判断预训练权重
+        assert not (init_cfg and (swin_pretrained or res_pretrained)), \
+            'init_cfg and pretrained cannot be setting at the same time'
+        # 初始化SwinTransformer权重
+        if isinstance(swin_pretrained, str):
+            warnings.warn('DeprecationWarning: pretrained is a deprecated, '
+                          'please use "init_cfg" instead')
+            self.swin_init_cfg = dict(type='Pretrained', checkpoint=swin_pretrained)
+        elif swin_pretrained is None:
+            swin_init_cfg = init_cfg
+        else:
+            raise TypeError('pretrained must be a str or None')
+        # 初始化Resnet
+        if isinstance(res_pretrained, str):
+            warnings.warn('DeprecationWarning: pretrained is a deprecated, '
+                          'please use "init_cfg" instead')
+            self.res_init_cfg = dict(type='Pretrained', checkpoint=res_pretrained)
+        elif res_pretrained is None:
+            self.res_init_cfg = [
+                dict(type='Kaiming', layer='Conv2d'),
+                dict(
+                    type='Constant',
+                    val=1,
+                    layer=['_BatchNorm', 'GroupNorm'])
+            ]
+            res_block = self.res_arch_settings[res_depth][0]
+            if self.res_zero_init_residual:
+                if res_block is BasicBlock:
+                    res_block_init_cfg = dict(
+                        type='Constant',
+                        val=0,
+                        override=dict(name='norm2')
+                    )
+                elif res_block is Bottleneck:
+                    res_block_init_cfg = dict(
+                        type='Constant',
+                        val=0,
+                        override=dict(name='norm3'))
+        else:
+            raise TypeError('pretrained must be a str or None')
+        super().__init__(init_cfg)
+
+        self.swin_patch_embed = PatchEmbed(
+            in_channels=in_channels,
+            embed_dims=swin_embed_dims,
+            conv_type='Conv2d',
+            kernel_size=swin_patch_size,
+            stride=swin_strides[0],
+            padding='corner',
+            norm_cfg=swin_norm_cfg if swin_patch_norm else None,
+            init_cfg=None
+        )
+
+        if self.swin_use_abs_pos_embed:
+            swin_patch_row = swin_pretrain_img_size[0] // swin_patch_size
+            swin_patch_col = swin_pretrain_img_size[1] // swin_patch_size
+            swin_num_patches = swin_patch_row * swin_patch_col
+            self.swin_absolute_pos_embed = nn.Parameter(
+                torch.zeros((1, swin_num_patches, swin_embed_dims)))
+        self.swin_drop_after_pos = nn.Dropout(p=swin_drop_rate)
+
+        swin_total_depth = sum(swin_depths)
+        swin_dpr = [x.item() for x in torch.linspace(0, swin_drop_path_rate, swin_total_depth)]
+        self.swin_stages = ModuleList()
+        swin_in_channels = swin_embed_dims
+        for i in range(swin_num_layers):
+            if i < swin_num_layers - 1:
+                swin_downsample = PatchMerging(
+                    in_channels=swin_in_channels,
+                    out_channels=2 * swin_in_channels,
+                    stride=swin_strides[i + 1],
+                    norm_cfg=swin_norm_cfg if swin_patch_norm else None,
+                    init_cfg=None
+                )
+            else:
+                swin_downsample = None
+            swin_stage = SwinBlockSequence(
+                embed_dims=swin_in_channels,
+                num_heads=swin_num_heads[i],
+                feedforward_channels=int(swin_mlp_ratio * swin_in_channels),
+                depth=swin_depths[i],
+                window_size=swin_window_size,
+                qkv_bias=swin_qkv_bias,
+                qk_scale=swin_qk_scale,
+                drop_rate=swin_drop_rate,
+                attn_drop_rate=swin_attn_drop_rate,
+                drop_path_rate=swin_dpr[sum(swin_depths[:i]):sum(swin_depths[:i + 1])],
+                downsample=swin_downsample,
+                act_cfg=swin_act_cfg,
+                norm_cfg=swin_norm_cfg,
+                with_cp=with_cp,
+                init_cfg=None)
+            self.swin_stages.append(swin_stage)
+            if swin_downsample:
+                swin_in_channels = swin_downsample.out_channels
+        self.swin_num_features = [int(swin_embed_dims * 2 ** i) for i in range(swin_num_layers)]
+        for i in out_indices:
+            swin_layer = build_norm_layer(swin_norm_cfg, self.swin_num_features[i])[1]
+            swin_layer_name = f'swin_norm{i}'
+            self.add_module(swin_layer_name, swin_layer)
+            # 构造网络
+        self.res_make_stem_layer(in_channels, res_stem_channels)
+        self.res_layers = []
+        for i, res_num_blocks in enumerate(self.res_stage_blocks):
+            res_stride = res_strides[i]
+            res_dilation = res_dilations[i]
+            res_dcn = self.res_dcn if self.res_stage_with_dcn[i] else None
+            if res_plugins is not None:
+                res_stage_plugins = self.res_make_stage_plugins(res_plugins, i)
+            else:
+                res_stage_plugins = None
+            # multi grid is applied to last layer only
+            res_stage_multi_grid = res_multi_grid if i == len(
+                self.res_stage_blocks) - 1 else None
+            res_planes = res_base_channels * 2 ** i
+            res_layer = self.make_res_layer(
+                block=self.res_block,
+                inplanes=self.res_inplanes,
+                planes=res_planes,
+                num_blocks=res_num_blocks,
+                stride=res_stride,
+                dilation=res_dilation,
+                style=self.res_style,
+                avg_down=self.res_avg_down,
+                with_cp=with_cp,
+                conv_cfg=res_conv_cfg,
+                norm_cfg=res_norm_cfg,
+                dcn=res_dcn,
+                plugins=res_stage_plugins,
+                multi_grid=res_stage_multi_grid,
+                contract_dilation=res_contract_dilation,
+                init_cfg=res_block_init_cfg)
+            self.res_inplanes = res_planes * self.res_block.expansion
+            res_layer_name = f'res_layer{i + 1}'
+            self.add_module(res_layer_name, res_layer)
+            self.res_layers.append(res_layer_name)
+
+    def res_make_res_layer(self, **kwargs):
+        return ResLayer(**kwargs)
+
+    @property
+    def res_norm1(self):
+        return getattr(self, self.res_norm1_name)
+
+    def res_make_stage_plugins(self, plugins, stage_idx):
+        stage_plugins = []
+        for plugin in plugins:
+            plugin = plugin.copy()
+            stages = plugin.pop('stages', None)
+            assert stages is None or len(stages) == self.res_num_stages
+            # whether to insert plugin into current stage
+            if stages is None or stages[stage_idx]:
+                stage_plugins.append(plugin)
+
+        return stage_plugins
+
+    def res_make_stem_layer(self, in_channels, stem_channels):
+        """ 构造 ResNet网络stem层"""
+        if self.res_deep_stem:
+            self.res_stem = nn.Sequential(
+                build_conv_layer(
+                    self.res_conv_cfg,
+                    in_channels,
+                    stem_channels // 2,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    bias=False),
+                build_norm_layer(self.res_norm_cfg, stem_channels // 2)[1],
+                nn.ReLU(inplace=True),
+                build_conv_layer(
+                    self.res_conv_cfg,
+                    stem_channels // 2,
+                    stem_channels // 2,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    bias=False),
+                build_norm_layer(self.res_norm_cfg, stem_channels // 2)[1],
+                nn.ReLU(inplace=True),
+                build_conv_layer(
+                    self.res_conv_cfg,
+                    stem_channels // 2,
+                    stem_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    bias=False),
+                build_norm_layer(self.norm_cfg, stem_channels)[1],
+                nn.ReLU(inplace=True))
+        else:
+            self.res_conv1 = build_conv_layer(
+                self.res_conv_cfg,
+                in_channels,
+                stem_channels,
+                kernel_size=7,
+                stride=2,
+                padding=3,
+                bias=False)
+            self.res_norm1_name, res_norm1 = build_norm_layer(
+                self.res_norm_cfg, stem_channels, postfix=1)
+            self.add_module(self.res_norm1_name, res_norm1)
+            self.res_relu = nn.ReLU(inplace=True)
+        self.res_maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+    def res_freeze_stages(self):
+        """冻结区块参数和归化层状态"""
+        if self.frozen_stages >= 0:
+            if self.res_deep_stem:
+                self.res_stem.eval()
+                for param in self.res_stem.parameters():
+                    param.requires_grad = False
+            else:
+                self.res_norm1.eval()
+                for m in [self.res_conv1, self.res_norm1]:
+                    for param in m.parameters():
+                        param.requires_grad = False
+        for i in range(1, self.frozen_stages + 1):
+            m = getattr(self, f'res_layer{i}')
+            m.eval()
+            for param in m.parameters():
+                param.requires_grad = False
+
+    def swin_freeze_stages(self):
+        if self.frozen_stages >= 0:
+            self.swin_patch_embed.eval()
+            for param in self.swin_patch_embed.parameters():
+                param.requires_grad = False
+            if self.swin_use_abs_pos_embed:
+                self.swin_absolute_pos_embed.requires_grad = False
+            self.swin_drop_after_pos.eval()
+
+        for i in range(1, self.frozen_stages + 1):
+
+            if (i - 1) in self.out_indices:
+                swin_norm_layer = getattr(self, f'swin_norm{i - 1}')
+                swin_norm_layer.eval()
+                for param in swin_norm_layer.parameters():
+                    param.requires_grad = False
+
+            m = self.swin_stagess[i - 1]
+            m.eval()
+            for param in m.parameters():
+                param.requires_grad = False
+
+    def swin_train(self, mode=True):
+        super().swin_train(mode)
+        self.swin_freeze_stages()
+
+    def res_train(self, mode=True):
+        super().res_train(mode)
+        self.res_freeze_stages()
+        if mode and self.res_norm_eval:
+            for m in self.modules():
+                if isinstance(m, _BatchNorm):
+                    m.eval()
+
+    def swin_init_weights(self):
+        if self.swin_init_cfg is None:
+            print_log(f'No pre-trained weights for '
+                      f'{self.__class__.__name__}, '
+                      f'training start from scratch')
+            if self.swin_use_abs_pos_embed:
+                trunc_normal_(self.swin_absolute_pos_embed, std=0.02)
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    trunc_normal_init(m, std=.02, bias=0.)
+                elif isinstance(m, nn.LayerNorm):
+                    constant_init(m, val=1.0, bias=0.)
+        else:
+            assert 'checkpoint' in self.swin_init_cfg, f'Only support ' \
+                                                       f'specify `Pretrained` in ' \
+                                                       f'`init_cfg` in ' \
+                                                       f'{self.__class__.__name__} '
+            swin_ckpt = CheckpointLoader.load_checkpoint(
+                self.swin_init_cfg['checkpoint'], logger=None, map_location='cpu')
+            if 'state_dict' in swin_ckpt:
+                _swin_state_dict = swin_ckpt['state_dict']
+            elif 'model' in swin_ckpt:
+                _swin_state_dict = swin_ckpt['model']
+            else:
+                _swin_state_dict = swin_ckpt
+
+            swin_state_dict = OrderedDict()
+            for k, v in _swin_state_dict.item():
+                if k.startswith('backbone.'):
+                    swin_state_dict[k[9:]] = v
+                else:
+                    swin_state_dict[k] = v
+            if list(swin_state_dict.keys())[0].startswith('module.'):
+                swin_state_dict = {k[7:]: v for k, v in swin_state_dict.items()}
+
+            if swin_state_dict.get('absolute_pos_embed') is not None:
+                swin_absolute_pos_embed = swin_state_dict['absolute_pos_embed']
+                swin_N1, swin_L, swin_C1 = swin_absolute_pos_embed.size()
+                swin_N2, swin_C2, swin_H, swin_W = self.swin_absolute_pos_embed.size()
+                if swin_N1 != swin_N2 or swin_C1 != swin_C2 or swin_L != swin_H * swin_W:
+                    print_log('Error in loading absolute_pos_embed, pass')
+                else:
+                    swin_state_dict['absolute_pos_embed'] = swin_absolute_pos_embed.view(
+                        swin_N2, swin_H, swin_W, swin_C2).permute(0, 3, 1, 2).contiguous()
+
+            swin_relative_position_bias_table_keys = [
+                k for k in swin_state_dict.keys()
+                if 'relative_position_bias_table' in k
+            ]
+            for table_key in swin_relative_position_bias_table_keys:
+                table_pretrained = swin_state_dict[table_key]
+                table_current = self.state_dict()[table_key]
+                L1, nH1 = table_pretrained.size()
+                L2, nH2 = table_current.size()
+                if nH1 != nH2:
+                    print_log(f'Error in loading {table_key}, pass')
+                elif L1 != L2:
+                    S1 = int(L1 ** 0.5)
+                    S2 = int(L2 ** 0.5)
+                    table_pretrained_resized = F.interpolate(
+                        table_pretrained.permute(1, 0).reshape(1, nH1, S1, S1),
+                        size=(S2, S2),
+                        mode='bicubic')
+                    swin_state_dict[table_key] = table_pretrained_resized.view(
+                        nH2, L2).permute(1, 0).contiguous()
+
+            # load state_dict
+            self.load_state_dict(swin_state_dict, strict=False)
+
+    def res_plus_swin_model(self, res_x, swin_x):
+        return res_x + swin_x
+
+    def forward(self, x):
+        res_x = x
+        swin_x, swin_hw_shape = self.swin_patch_embed(x)
+        # ResNet stem
+        if self.res_deep_stem:
+            res_x = self.res_stem(res_x)
+        else:
+            res_x = self.res_conv1(res_x)
+            res_x = self.res_norm1(res_x)
+            res_x = self.res_relu(res_x)
+        res_x = self.res_maxpool(res_x)
+        # SwinTransformer
+        if self.swin_use_abs_pos_embed:
+            swin_x = swin_x + self.swin_absolute_pos_embed
+        swin_x = self.swin_drop_after_pos(swin_x)
+        outs = []
+        for i, res_layer_name, _, swin_stage in zip(enumerate(self.res_layers), enumerate(self.swin_stages)):
+            res_layer = getattr(self, res_layer_name)
+            swin_x, swin_hw_shape, swin_out, swin_out_hw_shape = swin_stage(swin_x, swin_hw_shape)
+            res_x = res_layer(res_x)
+            if i in self.out_indices:
+                swin_norm_layer = getattr(self, f'swin_norm{i}')
+                swin_out = swin_norm_layer(swin_out)
+                swin_out = swin_out.view(-1, *swin_out_hw_shape, self.swin_num_features[i]).permute(0, 3, 1,
+                                                                                                    2).contiguous()
+                res_x = self.res_plus_swin_model(res_x, swin_out)
+                outs.append(res_x)
+        return outs
