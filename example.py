@@ -1,4 +1,5 @@
 norm_cfg = dict(type='SyncBN', requires_grad=True)
+backbone_norm_cfg = dict(type='LN', requires_grad=True)
 data_preprocessor = dict(
     type='SegDataPreProcessor',
     mean=[123.675, 116.28, 103.53],
@@ -17,43 +18,59 @@ model = dict(
         pad_val=0,
         seg_pad_val=255,
         size=(512, 512)),
-    pretrained='open-mmlab://resnet50_v1c',
     backbone=dict(
-        type='ResNetV1c',
-        depth=50,
-        base_channels=32,
-        num_stages=4,
+        type='SwinResNet',
+        swin_pretrain_img_size=224,
+        swin_embed_dims=128,
+        swin_patch_size=4,
+        swin_window_size=7,
+        swin_mlp_ratio=4,
+        swin_depths=[2, 2, 18, 2],
+        swin_num_heads=[4, 8, 16, 32],
+        swin_strides=(4, 2, 2, 2),
         out_indices=(0, 1, 2, 3),
-        dilations=(1, 1, 2, 4),
-        strides=(1, 2, 1, 1),
+        swin_qkv_bias=True,
+        swin_qk_scale=None,
+        swin_patch_norm=True,
+        swin_drop_rate=0.0,
+        swin_attn_drop_rate=0.0,
+        swin_drop_path_rate=0.3,
+        swin_use_abs_pos_embed=False,
+        swin_act_cfg=dict(type='GELU'),
+        swin_pretrained='pretrain/swin_base_patch4_window7_224.pth',
+        res_depth=50,
         norm_cfg=dict(type='SyncBN', requires_grad=True),
-        norm_eval=False,
-        style='pytorch',
-        contract_dilation=True),
+        res_num_stages=4,
+        res_base_channels=32,
+        res_dilations=(1, 1, 1, 1),
+        res_strides=(1, 2, 2, 2),
+        res_norm_eval=False,
+        res_deep_stem=True,
+        res_style='pytorch',
+        res_contract_dilation=True),
     decode_head=dict(
-        type='FCNHead',
-        in_channels=2048,
-        in_index=3,
+        type='UPerHead',
+        in_channels=[128, 256, 512, 1024],
+        in_index=[0, 1, 2, 3],
+        pool_scales=(1, 2, 3, 6),
         channels=512,
-        num_convs=2,
-        concat_input=True,
         dropout_ratio=0.1,
-        num_classes=19,
+        num_classes=6,
         norm_cfg=dict(type='SyncBN', requires_grad=True),
-        align_corners=True,
+        align_corners=False,
         loss_decode=dict(
             type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0)),
     auxiliary_head=dict(
         type='FCNHead',
-        in_channels=1024,
+        in_channels=512,
         in_index=2,
         channels=256,
         num_convs=1,
         concat_input=False,
         dropout_ratio=0.1,
-        num_classes=19,
+        num_classes=6,
         norm_cfg=dict(type='SyncBN', requires_grad=True),
-        align_corners=True,
+        align_corners=False,
         loss_decode=dict(
             type='CrossEntropyLoss', use_sigmoid=False, loss_weight=0.4)),
     train_cfg=dict(),
@@ -203,24 +220,33 @@ tta_model = dict(type='SegTTAModel')
 optimizer = dict(type='SGD', lr=0.01, momentum=0.9, weight_decay=0.0005)
 optim_wrapper = dict(
     type='OptimWrapper',
-    optimizer=dict(type='SGD', lr=0.01, momentum=0.9, weight_decay=0.0005),
-    clip_grad=None)
+    optimizer=dict(
+        type='AdamW', lr=6e-05, betas=(0.9, 0.999), weight_decay=0.01),
+    paramwise_cfg=dict(
+        custom_keys=dict(
+            absolute_pos_embed=dict(decay_mult=0.0),
+            relative_position_bias_table=dict(decay_mult=0.0),
+            norm=dict(decay_mult=0.0))))
 param_scheduler = [
     dict(
+        type='LinearLR', start_factor=1e-06, by_epoch=False, begin=0,
+        end=1500),
+    dict(
         type='PolyLR',
-        eta_min=0.0001,
-        power=0.9,
-        begin=0,
-        end=40000,
+        eta_min=0.0,
+        power=1.0,
+        begin=1500,
+        end=160000,
         by_epoch=False)
 ]
-train_cfg = dict(type='IterBasedTrainLoop', max_iters=40000, val_interval=4000)
+train_cfg = dict(
+    type='IterBasedTrainLoop', max_iters=160000, val_interval=20000)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 default_hooks = dict(
     timer=dict(type='IterTimerHook'),
     logger=dict(type='LoggerHook', interval=100, log_metric_by_epoch=False),
     param_scheduler=dict(type='ParamSchedulerHook'),
-    checkpoint=dict(type='CheckpointHook', by_epoch=False, interval=4000),
+    checkpoint=dict(type='CheckpointHook', by_epoch=False, interval=20000),
     sampler_seed=dict(type='DistSamplerSeedHook'),
     visualization=dict(type='SegVisualizationHook'))

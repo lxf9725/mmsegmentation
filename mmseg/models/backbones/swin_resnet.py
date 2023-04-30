@@ -1,4 +1,5 @@
 import warnings
+from collections import OrderedDict
 from copy import deepcopy
 
 import torch
@@ -8,20 +9,17 @@ import torch.utils.checkpoint as cp
 from mmcv.cnn import build_conv_layer, build_plugin_layer
 from mmcv.cnn import build_norm_layer
 from mmcv.cnn.bricks.transformer import FFN, build_dropout
+from mmengine.logging import print_log
 from mmengine.model import BaseModule, ModuleList
-from mmengine.model.weight_init import (trunc_normal_)
+from mmengine.model.weight_init import (constant_init, trunc_normal_,
+                                        trunc_normal_init)
+from mmengine.runner import CheckpointLoader
 from mmengine.utils import to_2tuple
 from mmengine.utils.dl_utils.parrots_wrapper import _BatchNorm
-from mmengine.logging import print_log
+
 from mmseg.registry import MODELS
 from ..utils import ResLayer
 from ..utils.embed import PatchEmbed, PatchMerging
-
-from mmengine.model.weight_init import (constant_init, trunc_normal_,
-                                        trunc_normal_init)
-
-from mmengine.runner import CheckpointLoader
-from collections import OrderedDict
 
 
 class BasicBlock(BaseModule):
@@ -792,9 +790,9 @@ class SwinResNet(BaseModule):
                  swin_drop_rate=0.,
                  swin_attn_drop_rate=0.,
                  swin_drop_path_rate=0.1,
-                 swin_use_abs_pas_embed=False,
+                 swin_use_abs_pos_embed=False,
                  swin_act_cfg=dict(type='GELU'),
-                 swin_norm_cfg=dict(type='LN'),
+                 swin_norm_cfg=dict(type='LN', requires_grad=True),
                  res_stem_channels=64,
                  res_base_channels=64,
                  res_num_stages=4,
@@ -804,7 +802,7 @@ class SwinResNet(BaseModule):
                  res_deep_stem=False,
                  res_avg_down=False,
                  res_conv_cfg=None,
-                 res_norm_cfg=dict(type='BN', requires_grad=True),
+                 norm_cfg=dict(type='BN', requires_grad=True),
                  res_norm_eval=False,
                  res_dcn=None,
                  res_stage_with_dcn=(False, False, False, False),
@@ -817,6 +815,8 @@ class SwinResNet(BaseModule):
                  res_pretrained=None,
                  frozen_stages=-1,
                  init_cfg=None):
+        super().__init__(init_cfg)
+
         # ResNet
         self.res_depth = res_depth
         self.frozen_stages = frozen_stages,
@@ -839,7 +839,7 @@ class SwinResNet(BaseModule):
         self.res_avg_down = res_avg_down
         self.with_cp = with_cp,
         self.res_conv_cfg = res_conv_cfg
-        self.res_norm_cfg = res_norm_cfg
+        self.norm_cfg = norm_cfg
         self.res_norm_eval = res_norm_eval
         self.res_dcn = res_dcn
         self.res_stage_with_dcn = res_stage_with_dcn
@@ -854,7 +854,7 @@ class SwinResNet(BaseModule):
 
         # SwinTransformer
         swin_num_layers = len(swin_depths)
-        self.swin_use_abs_pos_embed = swin_use_abs_pas_embed
+        self.swin_use_abs_pos_embed = swin_use_abs_pos_embed
         assert swin_strides[0] == swin_patch_size, 'Use non-overlapping patch embed.'
         # 判断输入配置是否正确
         # 判断resnet块个数设置是否正确
@@ -880,6 +880,8 @@ class SwinResNet(BaseModule):
         elif swin_pretrained is None:
             swin_init_cfg = init_cfg
         else:
+            print(type(swin_pretrained))
+            print('swin_pretrained')
             raise TypeError('pretrained must be a str or None')
         # 初始化Resnet
         if isinstance(res_pretrained, str):
@@ -908,8 +910,9 @@ class SwinResNet(BaseModule):
                         val=0,
                         override=dict(name='norm3'))
         else:
+            print(type(res_pretrained))
+            print('res_pretrained')
             raise TypeError('pretrained must be a str or None')
-        super().__init__(init_cfg)
 
         self.swin_patch_embed = PatchEmbed(
             in_channels=in_channels,
@@ -995,7 +998,7 @@ class SwinResNet(BaseModule):
                 avg_down=self.res_avg_down,
                 with_cp=with_cp,
                 conv_cfg=res_conv_cfg,
-                norm_cfg=res_norm_cfg,
+                norm_cfg=norm_cfg,
                 dcn=res_dcn,
                 plugins=res_stage_plugins,
                 multi_grid=res_stage_multi_grid,
@@ -1006,7 +1009,7 @@ class SwinResNet(BaseModule):
             self.add_module(res_layer_name, res_layer)
             self.res_layers.append(res_layer_name)
 
-    def res_make_res_layer(self, **kwargs):
+    def make_res_layer(self, **kwargs):
         return ResLayer(**kwargs)
 
     @property
@@ -1037,7 +1040,7 @@ class SwinResNet(BaseModule):
                     stride=2,
                     padding=1,
                     bias=False),
-                build_norm_layer(self.res_norm_cfg, stem_channels // 2)[1],
+                build_norm_layer(self.norm_cfg, stem_channels // 2)[1],
                 nn.ReLU(inplace=True),
                 build_conv_layer(
                     self.res_conv_cfg,
@@ -1047,7 +1050,7 @@ class SwinResNet(BaseModule):
                     stride=1,
                     padding=1,
                     bias=False),
-                build_norm_layer(self.res_norm_cfg, stem_channels // 2)[1],
+                build_norm_layer(self.norm_cfg, stem_channels // 2)[1],
                 nn.ReLU(inplace=True),
                 build_conv_layer(
                     self.res_conv_cfg,
@@ -1069,7 +1072,7 @@ class SwinResNet(BaseModule):
                 padding=3,
                 bias=False)
             self.res_norm1_name, res_norm1 = build_norm_layer(
-                self.res_norm_cfg, stem_channels, postfix=1)
+                self.norm_cfg, stem_channels, postfix=1)
             self.add_module(self.res_norm1_name, res_norm1)
             self.res_relu = nn.ReLU(inplace=True)
         self.res_maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
@@ -1214,7 +1217,9 @@ class SwinResNet(BaseModule):
             swin_x = swin_x + self.swin_absolute_pos_embed
         swin_x = self.swin_drop_after_pos(swin_x)
         outs = []
-        for i, res_layer_name, _, swin_stage in zip(enumerate(self.res_layers), enumerate(self.swin_stages)):
+        for enumerate_res_layers, enumerate_swin_stages in zip(enumerate(self.res_layers), enumerate(self.swin_stages)):
+            i, res_layer_name = enumerate_res_layers
+            _, swin_stage = enumerate_swin_stages
             res_layer = getattr(self, res_layer_name)
             swin_x, swin_hw_shape, swin_out, swin_out_hw_shape = swin_stage(swin_x, swin_hw_shape)
             res_x = res_layer(res_x)
