@@ -10,17 +10,17 @@ model = dict(
     pretrained=None,
     backbone=dict(
         img_size=(512, 512),
-        drop_rate=0.,),
-        # init_cfg=dict(
-        #     type='Pretrained', checkpoint='pretrain/vit_large_p16.pth')),
-    decode_head=dict(num_classes=6),
+        drop_rate=0.,
+        init_cfg=dict(
+            type='Pretrained', checkpoint='pretrain/vit_large_p16.pth')),
+    decode_head=dict(num_classes=150),
     auxiliary_head=[
         dict(
             type='SETRUPHead',
             in_channels=1024,
             channels=256,
             in_index=0,
-            num_classes=6,
+            num_classes=150,
             dropout_ratio=0,
             norm_cfg=norm_cfg,
             act_cfg=dict(type='ReLU'),
@@ -34,7 +34,7 @@ model = dict(
             in_channels=1024,
             channels=256,
             in_index=1,
-            num_classes=6,
+            num_classes=150,
             dropout_ratio=0,
             norm_cfg=norm_cfg,
             act_cfg=dict(type='ReLU'),
@@ -48,7 +48,7 @@ model = dict(
             in_channels=1024,
             channels=256,
             in_index=2,
-            num_classes=6,
+            num_classes=150,
             dropout_ratio=0,
             norm_cfg=norm_cfg,
             act_cfg=dict(type='ReLU'),
