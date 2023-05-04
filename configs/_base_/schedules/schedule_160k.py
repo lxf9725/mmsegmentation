@@ -7,7 +7,7 @@ param_scheduler = [
         type='PolyLR',
         eta_min=1e-4,
         power=0.9,
-        begin=20000,
+        begin=0,
         end=160000,
         by_epoch=False)
 ]

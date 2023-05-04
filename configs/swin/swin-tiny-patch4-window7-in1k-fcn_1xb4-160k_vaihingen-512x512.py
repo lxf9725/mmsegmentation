@@ -16,7 +16,7 @@ model = dict(
         use_abs_pos_embed=False,
         drop_path_rate=0.3,
         patch_norm=True),
-    decode_head=dict(in_channels=768, num_classes=6))
+    decode_head=dict(in_channels=1024, num_classes=6))
 
 # AdamW optimizer, no weight decay for position embedding & layer norm
 # in backbone
@@ -46,6 +46,6 @@ param_scheduler = [
 ]
 
 # By default, models are trained on 8 GPUs with 2 images per GPU
-train_dataloader = dict(batch_size=4)
+train_dataloader = dict(batch_size=1)
 val_dataloader = dict(batch_size=1)
 test_dataloader = val_dataloader
