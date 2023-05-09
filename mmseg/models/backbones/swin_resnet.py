@@ -1,14 +1,18 @@
 import warnings
 from collections import OrderedDict
 from copy import deepcopy
+from typing import Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
+from SoftPool import SoftPool2d
+
 from mmcv.cnn import build_conv_layer, build_plugin_layer
 from mmcv.cnn import build_norm_layer
 from mmcv.cnn.bricks.transformer import FFN, build_dropout
+
 from mmengine.logging import print_log
 from mmengine.model import BaseModule, ModuleList
 from mmengine.model.weight_init import (constant_init, trunc_normal_,
@@ -20,6 +24,170 @@ from mmengine.utils.dl_utils.parrots_wrapper import _BatchNorm
 from mmseg.registry import MODELS
 from ..utils import ResLayer
 from ..utils.embed import PatchEmbed, PatchMerging
+
+
+class BasicConv(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True,
+                 bn=True, bias=False):
+        super(BasicConv, self).__init__()
+        self.out_channels = out_planes
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding,
+                              dilation=dilation, groups=groups, bias=bias)
+        self.bn = nn.BatchNorm2d(out_planes, eps=1e-5, momentum=0.01, affine=True) if bn else None
+        self.relu = nn.ReLU() if relu else None
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.bn is not None:
+            x = self.bn(x)
+        if self.relu is not None:
+            x = self.relu(x)
+        return x
+
+
+# 可变形卷积
+class DeformConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, stride=1, bias=None, modulation=False):
+        """
+        Args:
+            modulation (bool, optional): If True, Modulated Deformable Convolution (Deformable ConvNets v2).
+        """
+        super(DeformConv2d, self).__init__()
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.stride = stride
+        self.zero_padding = nn.ZeroPad2d(padding)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=kernel_size, bias=bias)
+
+        self.p_conv = nn.Conv2d(in_channels, 2 * kernel_size * kernel_size, kernel_size=3, padding=1, stride=stride)
+        nn.init.constant_(self.p_conv.weight, 0)
+        self.p_conv.register_backward_hook(self._set_lr)
+
+        self.modulation = modulation
+        if modulation:
+            self.m_conv = nn.Conv2d(in_channels, kernel_size * kernel_size, kernel_size=3, padding=1, stride=stride)
+            nn.init.constant_(self.m_conv.weight, 0)
+            self.m_conv.register_backward_hook(self._set_lr)
+
+    @staticmethod
+    def _set_lr(module, grad_input, grad_output):
+        grad_input = (grad_input[i] * 0.1 for i in range(len(grad_input)))
+        grad_output = (grad_output[i] * 0.1 for i in range(len(grad_output)))
+
+    def forward(self, x):
+        offset = self.p_conv(x)
+        if self.modulation:
+            m = torch.sigmoid(self.m_conv(x))
+
+        dtype = offset.data.type()
+        ks = self.kernel_size
+        N = offset.size(1) // 2
+
+        if self.padding:
+            x = self.zero_padding(x)
+
+        # (b, 2N, h, w)
+        p = self._get_p(offset, dtype)
+
+        # (b, h, w, 2N)
+        p = p.contiguous().permute(0, 2, 3, 1)
+        q_lt = p.detach().floor()
+        q_rb = q_lt + 1
+
+        q_lt = torch.cat([torch.clamp(q_lt[..., :N], 0, x.size(2) - 1), torch.clamp(q_lt[..., N:], 0, x.size(3) - 1)],
+                         dim=-1).long()
+        q_rb = torch.cat([torch.clamp(q_rb[..., :N], 0, x.size(2) - 1), torch.clamp(q_rb[..., N:], 0, x.size(3) - 1)],
+                         dim=-1).long()
+        q_lb = torch.cat([q_lt[..., :N], q_rb[..., N:]], dim=-1)
+        q_rt = torch.cat([q_rb[..., :N], q_lt[..., N:]], dim=-1)
+
+        # clip p
+        p = torch.cat([torch.clamp(p[..., :N], 0, x.size(2) - 1), torch.clamp(p[..., N:], 0, x.size(3) - 1)], dim=-1)
+
+        # bilinear kernel (b, h, w, N)
+        g_lt = (1 + (q_lt[..., :N].type_as(p) - p[..., :N])) * (1 + (q_lt[..., N:].type_as(p) - p[..., N:]))
+        g_rb = (1 - (q_rb[..., :N].type_as(p) - p[..., :N])) * (1 - (q_rb[..., N:].type_as(p) - p[..., N:]))
+        g_lb = (1 + (q_lb[..., :N].type_as(p) - p[..., :N])) * (1 - (q_lb[..., N:].type_as(p) - p[..., N:]))
+        g_rt = (1 - (q_rt[..., :N].type_as(p) - p[..., :N])) * (1 + (q_rt[..., N:].type_as(p) - p[..., N:]))
+
+        # (b, c, h, w, N)
+        x_q_lt = self._get_x_q(x, q_lt, N)
+        x_q_rb = self._get_x_q(x, q_rb, N)
+        x_q_lb = self._get_x_q(x, q_lb, N)
+        x_q_rt = self._get_x_q(x, q_rt, N)
+
+        # (b, c, h, w, N)
+        x_offset = g_lt.unsqueeze(dim=1) * x_q_lt + \
+                   g_rb.unsqueeze(dim=1) * x_q_rb + \
+                   g_lb.unsqueeze(dim=1) * x_q_lb + \
+                   g_rt.unsqueeze(dim=1) * x_q_rt
+
+        # modulation
+        if self.modulation:
+            m = m.contiguous().permute(0, 2, 3, 1)
+            m = m.unsqueeze(dim=1)
+            m = torch.cat([m for _ in range(x_offset.size(1))], dim=1)
+            x_offset *= m
+
+        x_offset = self._reshape_x_offset(x_offset, ks)
+        out = self.conv(x_offset)
+
+        return out
+
+    def _get_p_n(self, N, dtype):
+        p_n_x, p_n_y = torch.meshgrid(
+            torch.arange(-(self.kernel_size - 1) // 2, (self.kernel_size - 1) // 2 + 1),
+            torch.arange(-(self.kernel_size - 1) // 2, (self.kernel_size - 1) // 2 + 1))
+        # (2N, 1)
+        p_n = torch.cat([torch.flatten(p_n_x), torch.flatten(p_n_y)], 0)
+        p_n = p_n.view(1, 2 * N, 1, 1).type(dtype)
+
+        return p_n
+
+    def _get_p_0(self, h, w, N, dtype):
+        p_0_x, p_0_y = torch.meshgrid(
+            torch.arange(1, h * self.stride + 1, self.stride),
+            torch.arange(1, w * self.stride + 1, self.stride))
+        p_0_x = torch.flatten(p_0_x).view(1, 1, h, w).repeat(1, N, 1, 1)
+        p_0_y = torch.flatten(p_0_y).view(1, 1, h, w).repeat(1, N, 1, 1)
+        p_0 = torch.cat([p_0_x, p_0_y], 1).type(dtype)
+
+        return p_0
+
+    def _get_p(self, offset, dtype):
+        N, h, w = offset.size(1) // 2, offset.size(2), offset.size(3)
+
+        # (1, 2N, 1, 1)
+        p_n = self._get_p_n(N, dtype)
+        # (1, 2N, h, w)
+        p_0 = self._get_p_0(h, w, N, dtype)
+        p = p_0 + p_n + offset
+        return p
+
+    def _get_x_q(self, x, q, N):
+        b, h, w, _ = q.size()
+        padded_w = x.size(3)
+        c = x.size(1)
+        # (b, c, h*w)
+        x = x.contiguous().view(b, c, -1)
+
+        # (b, h, w, N)
+        index = q[..., :N] * padded_w + q[..., N:]  # offset_x*w + offset_y
+        # (b, c, h*w*N)
+        index = index.contiguous().unsqueeze(dim=1).expand(-1, c, -1, -1, -1).contiguous().view(b, c, -1)
+
+        x_offset = x.gather(dim=-1, index=index).contiguous().view(b, c, h, w, N)
+
+        return x_offset
+
+    @staticmethod
+    def _reshape_x_offset(x_offset, ks):
+        b, c, h, w, N = x_offset.size()
+        x_offset = torch.cat([x_offset[..., s:s + ks].contiguous().view(b, c, h, w * ks) for s in range(0, N, ks)],
+                             dim=-1)
+        x_offset = x_offset.contiguous().view(b, c, h * ks, w * ks)
+
+        return x_offset
 
 
 class BasicBlock(BaseModule):
@@ -319,23 +487,6 @@ class Bottleneck(BaseModule):
 
 
 class WindowMSA(BaseModule):
-    """Window based multi-head self-attention (W-MSA) module with relative
-    position bias.
-
-    Args:
-        embed_dims (int): Number of input channels.
-        num_heads (int): Number of attention heads.
-        window_size (tuple[int]): The height and width of the window.
-        qkv_bias (bool, optional):  If True, add a learnable bias to q, k, v.
-            Default: True.
-        qk_scale (float | None, optional): Override default qk scale of
-            head_dim ** -0.5 if set. Default: None.
-        attn_drop_rate (float, optional): Dropout ratio of attention weight.
-            Default: 0.0
-        proj_drop_rate (float, optional): Dropout ratio of output. Default: 0.
-        init_cfg (dict | None, optional): The Config for initialization.
-            Default: None.
-    """
 
     def __init__(self,
                  embed_dims,
@@ -423,28 +574,6 @@ class WindowMSA(BaseModule):
 
 
 class ShiftWindowMSA(BaseModule):
-    """Shifted Window Multihead Self-Attention Module.
-
-    Args:
-        embed_dims (int): Number of input channels.
-        num_heads (int): Number of attention heads.
-        window_size (int): The height and width of the window.
-        shift_size (int, optional): The shift step of each window towards
-            right-bottom. If zero, act as regular window-msa. Defaults to 0.
-        qkv_bias (bool, optional): If True, add a learnable bias to q, k, v.
-            Default: True
-        qk_scale (float | None, optional): Override default qk scale of
-            head_dim ** -0.5 if set. Defaults: None.
-        attn_drop_rate (float, optional): Dropout ratio of attention weight.
-            Defaults: 0.
-        proj_drop_rate (float, optional): Dropout ratio of output.
-            Defaults: 0.
-        dropout_layer (dict, optional): The dropout_layer used before output.
-            Defaults: dict(type='DropPath', drop_prob=0.).
-        init_cfg (dict, optional): The extra config for initialization.
-            Default: None.
-    """
-
     def __init__(self,
                  embed_dims,
                  num_heads,
@@ -583,30 +712,6 @@ class ShiftWindowMSA(BaseModule):
 
 
 class SwinBlock(BaseModule):
-    """"
-    Args:
-        embed_dims (int): The feature dimension.
-        num_heads (int): Parallel attention heads.
-        feedforward_channels (int): The hidden dimension for FFNs.
-        window_size (int, optional): The local window scale. Default: 7.
-        shift (bool, optional): whether to shift window or not. Default False.
-        qkv_bias (bool, optional): enable bias for qkv if True. Default: True.
-        qk_scale (float | None, optional): Override default qk scale of
-            head_dim ** -0.5 if set. Default: None.
-        drop_rate (float, optional): Dropout rate. Default: 0.
-        attn_drop_rate (float, optional): Attention dropout rate. Default: 0.
-        drop_path_rate (float, optional): Stochastic depth rate. Default: 0.
-        act_cfg (dict, optional): The config dict of activation function.
-            Default: dict(type='GELU').
-        norm_cfg (dict, optional): The config dict of normalization.
-            Default: dict(type='LN').
-        with_cp (bool, optional): Use checkpoint or not. Using checkpoint
-            will save some memory while slowing down the training speed.
-            Default: False.
-        init_cfg (dict | list | None, optional): The init config.
-            Default: None.
-    """
-
     def __init__(self,
                  embed_dims,
                  num_heads,
@@ -670,39 +775,75 @@ class SwinBlock(BaseModule):
             x = cp.checkpoint(_inner_forward, x)
         else:
             x = _inner_forward(x)
-
+        x = x
         return x
 
 
+class FeatureComPreBlock(nn.Module):
+    def __init__(self, embed_dims):
+        super().__init__()
+        self.embed = embed_dims
+        self.dcn = DeformConv2d(embed_dims, embed_dims * 2, 3, padding=1, stride=2, modulation=True)
+        self.dconv = nn.Conv2d(embed_dims * 2, embed_dims * 2, kernel_size=3, dilation=2, padding=2)
+        self.conv1 = nn.Conv2d(embed_dims, embed_dims * 2, kernel_size=1, stride=1)
+        self.conv2 = nn.Conv2d(embed_dims, embed_dims * 2, kernel_size=1, stride=1)
+        self.conv3 = nn.Conv2d(embed_dims * 2, embed_dims * 2, kernel_size=1, stride=2)
+        self.bn1 = nn.BatchNorm2d(embed_dims)
+        self.bn2 = nn.BatchNorm2d(embed_dims * 2)
+        self.relu = nn.ReLU(inplace=True)
+        self.gn1 = nn.GroupNorm(embed_dims // 2, embed_dims)
+        self.gn2 = nn.GroupNorm(embed_dims, embed_dims * 2)
+        self.pool = SoftPool2d(kernel_size=(2, 2), stride=(2, 2))
+        self.gelu = nn.GELU()
+
+    def forward(self, x, input_size):
+        B, L, C = x.shape
+        assert isinstance(input_size, Sequence), f'Expect ' \
+                                                 f'input_size is ' \
+                                                 f'`Sequence` ' \
+                                                 f'but get {input_size}'
+
+        H, W = input_size
+        assert L == H * W, 'input feature has wrong size'
+        x = x.view(B, H, W, C).permute([0, 3, 1, 2])
+        short = x
+        x = self.gelu(self.bn2(self.conv1(x)))
+
+        x = self.bn2(self.dconv(x))
+
+        x = self.gelu(self.bn2(self.conv3(x)))
+        short = self.gn1(self.pool(short))
+
+        short = self.gelu(self.bn2(self.conv2(short)))
+        x = x + short
+        x = x.view(B, -1, 2 * C)  # B H/2*W/2 4*C
+        out_h = H // 2
+        out_w = W // 2
+        output_size = (out_h, out_w)
+        return x, output_size
+
+
+class SpaceInterBlock(nn.Module):
+    def __int__(self, embed_dim):
+        super().__int__()
+        self.embed_dim = embed_dim
+        self.conv1 = nn.Conv2d(embed_dim, embed_dim // 2, kernel_size=3, dilation=2, stride=1, padding=2)
+        self.conv2 = nn.Conv2d(embed_dim // 2, embed_dim, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(embed_dim // 2)
+        self.bn2 = nn.BatchNorm2d(embed_dim)
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.gelu = nn.GELU()
+
+    def forward(self, sim_x, swin_x):
+        s = self.gelu(self.bn1(self.conv1(sim_x)))
+        s_h, s_w = self.pool_h(s), self.pool_w(s)
+        s = torch.matmul(s_h, s_w)
+        s = self.gelu(self.bn2(self.conv2(s)))
+        return s + swin_x
+
+
 class SwinBlockSequence(BaseModule):
-    """Implements one stage in Swin Transformer.
-
-    Args:
-        embed_dims (int): The feature dimension.
-        num_heads (int): Parallel attention heads.
-        feedforward_channels (int): The hidden dimension for FFNs.
-        depth (int): The number of blocks in this stage.
-        window_size (int, optional): The local window scale. Default: 7.
-        qkv_bias (bool, optional): enable bias for qkv if True. Default: True.
-        qk_scale (float | None, optional): Override default qk scale of
-            head_dim ** -0.5 if set. Default: None.
-        drop_rate (float, optional): Dropout rate. Default: 0.
-        attn_drop_rate (float, optional): Attention dropout rate. Default: 0.
-        drop_path_rate (float | list[float], optional): Stochastic depth
-            rate. Default: 0.
-        downsample (BaseModule | None, optional): The downsample operation
-            module. Default: None.
-        act_cfg (dict, optional): The config dict of activation function.
-            Default: dict(type='GELU').
-        norm_cfg (dict, optional): The config dict of normalization.
-            Default: dict(type='LN').
-        with_cp (bool, optional): Use checkpoint or not. Using checkpoint
-            will save some memory while slowing down the training speed.
-            Default: False.
-        init_cfg (dict | list | None, optional): The init config.
-            Default: None.
-    """
-
     def __init__(self,
                  embed_dims,
                  num_heads,
@@ -747,10 +888,17 @@ class SwinBlockSequence(BaseModule):
             self.blocks.append(block)
 
         self.downsample = downsample
+        self.sim = SpaceInterBlock(embed_dims)
 
     def forward(self, x, hw_shape):
+        sin_x = x
+        i = 1
         for block in self.blocks:
             x = block(x, hw_shape)
+            if i % 2 == 0:
+                sin_x = self.sim(sin_x, x)
+                x = sin_x
+            i += 1
 
         if self.downsample:
             x_down, down_hw_shape = self.downsample(x, hw_shape)
@@ -759,11 +907,69 @@ class SwinBlockSequence(BaseModule):
             return x, hw_shape, x, hw_shape
 
 
-@MODELS.register_module()
-class SwinResNet(BaseModule):
+# relative aggregate model
+# 在batch中分别展平每一个tensor
+class Flatten(nn.Module):
+    def forward(self, x):
+        return x.view(x.size(0), -1)
+
+
+# 注意力机制
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=2, pool_types=None):
+        super().__init__()
+        if pool_types is None:
+            pool_types = ['avg', 'max', 'soft']
+        self.in_channels = in_channels
+        self.mlp = nn.Sequential(
+            Flatten(),
+            nn.Linear(in_channels, in_channels // reduction_ratio),
+            nn.ReLU()
+        )
+        self.pool_types = pool_types
+        self.incr = nn.Linear(in_channels // reduction_ratio, in_channels)
+
+    def forward(self, x):
+        channel_attention_sum = None
+        # 每个通道得到1x1的pool
+        avg_pool = F.avg_pool2d(x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))
+        max_pool = F.max_pool1d(x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))
+        avg_pool_mlp = self.mlp(avg_pool)
+        max_pool_mlp = self.mlp(max_pool)
+        pool_add = avg_pool_mlp + max_pool_mlp
+        # 须引入SoftPool
+        soft_pool = SoftPool2d(kernel_size=(x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))
+        soft_pool_mlp = self.mlp(soft_pool)
+        weight_pool = soft_pool * pool_add
+        channel_attention_sum = self.incr(weight_pool)
+        att = torch.sigmoid(channel_attention_sum).unsqueeze(2).unsqueeze(3).expand_as(x)
+        return att
+
+
+class ResPlusSwinBlock(nn.Module):
+    """
+    in_channels:SwinTransform块输入维度
+    out_channels:该阶段网络输出维度
     """
 
-    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1x1 = BasicConv(in_planes=in_channels, out_planes=out_channels, kernel_size=1,
+                                 stride=1, groups=1, relu=True, bn=True, bias=False)
+        self.fuse = ChannelAttention(in_channels=out_channels, reduction_ratio=2)
+        self.dcn = DeformConv2d(in_channels=out_channels, out_channels=out_channels,
+                                kernel_size=3, stride=1, padding=0, modulation=True)
+
+    def forward(self, res_x, swin_x):
+        res_x = self.dcn(res_x)
+        s1 = self.conv1x1(swin_x)
+        short = self.fuse(s1)
+        short = short * res_x
+        return self.res_x + short + s1
+
+
+@MODELS.register_module()
+class SwinResNet(BaseModule):
     res_arch_settings = {
         18: (BasicBlock, (2, 2, 2, 2)),
         34: (BasicBlock, (3, 4, 6, 3)),
@@ -939,13 +1145,14 @@ class SwinResNet(BaseModule):
         swin_in_channels = swin_embed_dims
         for i in range(swin_num_layers):
             if i < swin_num_layers - 1:
-                swin_downsample = PatchMerging(
-                    in_channels=swin_in_channels,
-                    out_channels=2 * swin_in_channels,
-                    stride=swin_strides[i + 1],
-                    norm_cfg=swin_norm_cfg if swin_patch_norm else None,
-                    init_cfg=None
-                )
+                swin_downsample = FeatureComPreBlock(embed_dims=swin_in_channels)
+                # swin_downsample = PatchMerging(
+                #     in_channels=swin_in_channels,
+                #     out_channels=2 * swin_in_channels,
+                #     stride=swin_strides[i + 1],
+                #     norm_cfg=swin_norm_cfg if swin_patch_norm else None,
+                #     init_cfg=None
+                # )
             else:
                 swin_downsample = None
             swin_stage = SwinBlockSequence(
@@ -966,7 +1173,7 @@ class SwinResNet(BaseModule):
                 init_cfg=None)
             self.swin_stages.append(swin_stage)
             if swin_downsample:
-                swin_in_channels = swin_downsample.out_channels
+                swin_in_channels = 2 * swin_in_channels
         self.swin_num_features = [int(swin_embed_dims * 2 ** i) for i in range(swin_num_layers)]
         for i in out_indices:
             swin_layer = build_norm_layer(swin_norm_cfg, self.swin_num_features[i])[1]
@@ -1008,6 +1215,12 @@ class SwinResNet(BaseModule):
             res_layer_name = f'res_layer{i + 1}'
             self.add_module(res_layer_name, res_layer)
             self.res_layers.append(res_layer_name)
+
+            self.res_plus_swin_blocks = ModuleList()
+            self.res_plus_swin_blocks.append(ResPlusSwinBlock(128, 256))
+            self.res_plus_swin_blocks.append(ResPlusSwinBlock(256, 512))
+            self.res_plus_swin_blocks.append(ResPlusSwinBlock(512, 1024))
+            self.res_plus_swin_blocks.append(ResPlusSwinBlock(1024, 2048))
 
     def make_res_layer(self, **kwargs):
         return ResLayer(**kwargs)
@@ -1129,6 +1342,7 @@ class SwinResNet(BaseModule):
                 if isinstance(m, _BatchNorm):
                     m.eval()
 
+    # 加载SwinTransformer预训练权重并初始化
     def swin_init_weights(self):
         if self.swin_init_cfg is None:
             print_log(f'No pre-trained weights for '
@@ -1198,8 +1412,7 @@ class SwinResNet(BaseModule):
             # load state_dict
             self.load_state_dict(swin_state_dict, strict=False)
 
-    def res_plus_swin_model(self, res_x, swin_x):
-        return res_x + swin_x
+    # 融合SwinTransformer模块与ResNet模块输出
 
     def forward(self, x):
         res_x = x
@@ -1228,6 +1441,7 @@ class SwinResNet(BaseModule):
                 swin_out = swin_norm_layer(swin_out)
                 swin_out = swin_out.view(-1, *swin_out_hw_shape, self.swin_num_features[i]).permute(0, 3, 1,
                                                                                                     2).contiguous()
-                res_x = self.res_plus_swin_model(res_x, swin_out)
+
+                res_x = self.res_plus_swin_blocks[i](res_x, swin_out)
                 outs.append(res_x)
         return outs
