@@ -9,3 +9,5 @@ model = dict(
     data_preprocessor=data_preprocessor,
     decode_head=dict(align_corners=True),
     auxiliary_head=dict(align_corners=True))
+val_evaluator = dict(type='IoUMetric', iou_metrics=['mIoU', 'mDice', 'mFscore'])
+test_evaluator = val_evaluator

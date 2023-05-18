@@ -9,3 +9,6 @@ model = dict(
         depths=[2, 2, 18, 2],
         num_heads=[4, 8, 16, 32]),
     decode_head=dict(in_channels=1024, num_classes=6))
+
+val_evaluator = dict(type='IoUMetric', iou_metrics=['mIoU', 'mDice', 'mFscore'])
+test_evaluator = val_evaluator

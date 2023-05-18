@@ -11,3 +11,5 @@ model = dict(
                      num_classes=6),
     auxiliary_head=dict(align_corners=True,
                         num_classes=6))
+val_evaluator = dict(type='IoUMetric', iou_metrics=['mIoU', 'mDice', 'mFscore'])
+test_evaluator = val_evaluator

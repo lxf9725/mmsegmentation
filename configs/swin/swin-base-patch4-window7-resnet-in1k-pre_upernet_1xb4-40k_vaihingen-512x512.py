@@ -1,5 +1,5 @@
 _base_ = [
-    '../_base_/models/swin_resnet.py', '../_base_/datasets/vaihingen.py',
+    '../_base_/models/swin_resnet_no_block.py', '../_base_/datasets/vaihingen.py',
     '../_base_/default_runtime.py', '../_base_/schedules/schedule_160k.py'
 ]
 crop_size = (512, 512)
@@ -11,7 +11,9 @@ model = dict(
         swin_depths=[2, 2, 18, 2],
         swin_num_heads=[4, 8, 16, 32]),
     decode_head=dict(in_channels=[128, 256, 512, 1024], num_classes=6),
-    auxiliary_head=dict(in_channels=512, num_classes=6)
+    auxiliary_head=dict(in_channels=512, num_classes=6),
+    test_cfg=dict(mode='whole')
+
 )
 # AdamW optimizer, no weight decay for position embedding & layer norm
 # in backbone
@@ -44,3 +46,5 @@ param_scheduler = [
 train_dataloader = dict(batch_size=4)
 val_dataloader = dict(batch_size=1)
 test_dataloader = val_dataloader
+val_evaluator = dict(type='IoUMetric', iou_metrics=['mIoU', 'mDice', 'mFscore'])
+test_evaluator = val_evaluator
